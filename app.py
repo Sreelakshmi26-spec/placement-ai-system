@@ -1,133 +1,197 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import json
+import smtplib
+
 from model_pipeline import run_pipeline
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
 
-st.set_page_config(layout="wide")
+# ---------------- PAGE CONFIG ----------------
+st.set_page_config(
+    page_title="Placement AI System",
+    page_icon="🎯",
+    layout="wide"
+)
 
-st.title("🎯 AI Early Warning System for Placements")
+# ---------------- SESSION STATE ----------------
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
 
-uploaded_file = st.file_uploader("Upload Student CSV", type=["csv"])
+if "role" not in st.session_state:
+    st.session_state.role = None
 
-if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
-    st.success("Custom dataset loaded!")
-else:
+if "student_id" not in st.session_state:
+    st.session_state.student_id = None
+
+
+# ---------------- LOAD USERS ----------------
+def load_users():
+    with open("users.json", "r") as f:
+        return json.load(f)
+
+
+# ---------------- LOGIN PAGE ----------------
+def login_page():
+    st.markdown("<h1 style='text-align:center;'>🎓 Placement AI System</h1>", unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+
+    with col2:
+        st.markdown("""
+        <div style="
+            background: rgba(255,255,255,0.06);
+            padding: 30px;
+            border-radius: 20px;
+            backdrop-filter: blur(15px);
+            border: 1px solid rgba(255,255,255,0.1);
+        ">
+        """, unsafe_allow_html=True)
+
+        role = st.selectbox("Login As", ["TPC", "Student"])
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+
+        users = load_users()
+
+        if st.button("Login"):
+            username = username.strip()
+            password = password.strip()
+
+            if username in users and users[username]["password"] == password:
+
+                if users[username]["role"] == role:
+
+                    st.session_state.logged_in = True
+                    st.session_state.role = role
+                    st.session_state.student_id = username
+
+                    st.rerun()
+                else:
+                    st.error("Role mismatch!")
+
+            else:
+                st.error("Invalid credentials")
+
+
+# ---------------- PDF REPORT ----------------
+def generate_pdf(df):
+    pdf = SimpleDocTemplate("report.pdf")
+    styles = getSampleStyleSheet()
+
+    content = [Paragraph("Placement Report", styles["Title"])]
+    pdf.build(content)
+
+
+# ---------------- EMAIL ALERT ----------------
+def send_email(student_id):
+    print(f"Alert sent for student {student_id}")
+
+
+# ---------------- INTERVENTION ----------------
+def generate_intervention(score):
+    if score > 80:
+        return "Immediate mentor + mock interviews"
+    elif score > 50:
+        return "Weekly coding + aptitude training"
+    else:
+        return "Soft skills + consistency plan"
+
+
+# ---------------- ADMIN DASHBOARD ----------------
+def show_admin_dashboard(df):
+    st.title("📊 Admin Dashboard")
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Students", len(df))
+    col2.metric("High Risk", len(df[df["risk_score"] > 80]))
+    col3.metric("Avg Probability", round(df["placement_prob"].mean(), 2))
+
+    st.subheader("All Students")
+    st.dataframe(df)
+
+
+# ---------------- STUDENT DASHBOARD ----------------
+def show_student_dashboard(df):
+    st.title("🎓 My Dashboard")
+
+    sid = st.session_state.student_id
+    student = df[df["student_id"] == int(sid)]
+
+    if not student.empty:
+        st.metric("Risk Score", float(student["risk_score"].values[0]))
+        st.metric("Placement Probability", float(student["placement_prob"].values[0]))
+
+        st.write("Segment:", student["segment"].values[0])
+        st.write("Recommendations:", student["recommendations"].values[0])
+
+
+# ---------------- MAIN APP ----------------
+def main_page():
+
     df = run_pipeline()
+    df["intervention"] = df["risk_score"].apply(generate_intervention)
 
-# -----------------------------
-# Sidebar Filters
-# -----------------------------
-st.sidebar.header("Filters")
+    st.sidebar.title("Navigation")
+    page = st.sidebar.radio("Go to", ["Dashboard", "Students", "Analytics"])
 
-risk_level_filter = st.sidebar.multiselect(
-    "Risk Level",
-    df["risk_level"].unique(),
-    default=df["risk_level"].unique()
-)
+    # ---------------- DASHBOARD ----------------
+    if page == "Dashboard":
 
-risk_filter = st.sidebar.slider("Risk Score", 0, 100, (0, 100))
-segment_filter = st.sidebar.multiselect(
-    "Segment", df["segment"].unique(), default=df["segment"].unique()
-)
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Students", len(df))
+        col2.metric("High Risk", len(df[df["risk_score"] > 80]))
+        col3.metric("Avg Prob", f"{df['placement_prob'].mean():.2f}")
 
-filtered_df = df[
-    (df["risk_score"].between(risk_filter[0], risk_filter[1])) &
-    (df["segment"].isin(segment_filter)) &
-    (df["risk_level"].isin(risk_level_filter))
-]
+        st.plotly_chart(px.histogram(df, x="risk_score"), use_container_width=True)
+        st.plotly_chart(px.pie(df, names="segment"), use_container_width=True)
 
-# -----------------------------
-# KPIs
-# -----------------------------
-col1, col2, col3 = st.columns(3)
+        if st.session_state.role == "TPC":
+            show_admin_dashboard(df)
+        else:
+            show_student_dashboard(df)
 
-col1.metric("Total Students", len(df))
-col2.metric("High Risk Students", len(df[df["risk_score"] > 70]))
-col3.metric("Avg Placement Probability", round(df["placement_prob"].mean(), 2))
+    # ---------------- STUDENTS ----------------
+    elif page == "Students":
 
-# -----------------------------
-# Charts
-# -----------------------------
-st.subheader("📊 Risk Distribution")
-fig1 = px.histogram(df, x="risk_score", nbins=20)
-st.plotly_chart(fig1, use_container_width=True)
+        st.subheader("Top Risk Students")
+        st.dataframe(df.sort_values("risk_score", ascending=False).head(20))
 
-st.subheader("📊 Placement Probability")
-fig2 = px.histogram(df, x="placement_prob")
-st.plotly_chart(fig2, use_container_width=True)
+        st.subheader("Student Lookup")
+        sid = st.number_input("Enter Student ID", step=1)
 
-st.subheader("📊 Student Segments")
-fig3 = px.pie(df, names="segment")
-st.plotly_chart(fig3, use_container_width=True)
+        student = df[df["student_id"] == sid]
 
-# -----------------------------
-# At-Risk Students
-# -----------------------------
-st.subheader("🚨 Top At-Risk Students")
+        if not student.empty:
+            st.success("Student Found")
 
-top_risk = df.sort_values(by="risk_score", ascending=False).head(20)
+            st.metric("Risk Score", float(student["risk_score"].values[0]))
+            st.metric("Placement Prob", float(student["placement_prob"].values[0]))
+            st.write(student["segment"].values[0])
+            st.write(student["recommendations"].values[0])
 
-st.dataframe(top_risk[[
-    "student_id",
-    "risk_score",
-    "placement_prob",
-    "segment",
-    "recommendations"
-]])
+    # ---------------- ANALYTICS ----------------
+    elif page == "Analytics":
 
-# -----------------------------
-# Alerts Section
-# -----------------------------
-st.subheader("🚨 High Risk Alerts")
+        st.subheader("Weak Areas")
+        weak = {
+            "Coding": (df["coding_score"] < 50).sum(),
+            "Communication": (df["communication_score"] < 50).sum(),
+            "Aptitude": (df["aptitude_score"] < 50).sum()
+        }
 
-high_risk_students = df[df["risk_score"] > 80]
+        st.bar_chart(weak)
 
-for _, row in high_risk_students.head(5).iterrows():
-    st.warning(f"Student {row['student_id']} needs immediate attention!")
+        st.download_button(
+            "Download Report",
+            df.to_csv(index=False),
+            "report.csv"
+        )
 
-# -----------------------------
-# Student View
-# -----------------------------
-# -----------------------------
-# Weak Areas Analysis
-# -----------------------------
-st.subheader("📉 Most Common Weak Areas")
 
-weak_areas = {
-    "Coding": (df["coding_score"] < 50).sum(),
-    "Communication": (df["communication_score"] < 50).sum(),
-    "Aptitude": (df["aptitude_score"] < 50).sum()
-}
-
-st.bar_chart(weak_areas)
-
-st.subheader("🎓 Student Lookup")
-
-student_id = st.number_input("Enter Student ID", min_value=0, max_value=1200, step=1)
-
-student = df[df["student_id"] == student_id]
-
-if not student.empty:
-    st.metric("Risk Score", round(student["risk_score"].values[0], 2))
-    st.metric("Placement Probability", round(student["placement_prob"].values[0], 2))
-
-    st.write("### Segment")
-    st.write(student["segment"].values[0])
-
-    st.write("### Recommendations")
-    st.write(student["recommendations"].values[0])
-
-    # -----------------------------
-# Download Report
-# -----------------------------
-st.subheader("📥 Download Student Report")
-
-csv = df.to_csv(index=False)
-
-st.download_button(
-    label="Download Full Report",
-    data=csv,
-    file_name="student_risk_report.csv",
-    mime="text/csv"
-)
+# ---------------- APP ROUTER ----------------
+if not st.session_state.logged_in:
+    login_page()
+else:
+    main_page()
