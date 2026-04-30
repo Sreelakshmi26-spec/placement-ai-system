@@ -1,8 +1,8 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+import joblib
+import streamlit as st
 from sklearn.cluster import KMeans
-from xgboost import XGBClassifier
 
 # -----------------------------
 # 1. Generate Data
@@ -39,134 +39,130 @@ def generate_data(n=1200):
 
 
 # -----------------------------
-# 2. Train Model
+# 2. Load Model
 # -----------------------------
-def train_model(df):
-    X = df.drop(["placement_status", "student_id"], axis=1)
-    y = df["placement_status"]
-
-    from sklearn.model_selection import train_test_split
-    from xgboost import XGBClassifier
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-
-    model = XGBClassifier(
-        n_estimators=100,
-        max_depth=5,
-        learning_rate=0.1,
-        eval_metric="logloss"
-    )
-
-    model.fit(X_train, y_train)
-
-    return model
+@st.cache_resource
+def load_model():
+    return joblib.load("model.pkl")
 
 
 # -----------------------------
-# 3. Clustering
+# 3. Expected Features (IMPORTANT)
 # -----------------------------
-def cluster_students(df):
-    features = df[[
-        "cgpa",
-        "coding_score",
-        "communication_score",
-        "mock_interview_score",
-        "aptitude_score"
-    ]]
-
-    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-    df["cluster"] = kmeans.fit_predict(features)
-
-    mapping = {
-        0: "Unprepared",
-        1: "At Risk",
-        2: "Ready"
-    }
-
-    df["segment"] = df["cluster"].map(mapping)
-
-    return df, kmeans
+EXPECTED_COLUMNS = [
+    "student_id",
+    "attendance_percentage",
+    "cgpa",
+    "aptitude_score",
+    "coding_score",
+    "communication_score",
+    "mock_interview_score",
+    "number_of_applications",
+    "number_of_interviews",
+    "internship_experience",
+    "projects_count",
+    "last_activity_days"
+]
 
 
 # -----------------------------
-# 4. Risk Calculation
+# 4. Main Pipeline
 # -----------------------------
-def calculate_risk(df, model):
-    X = df.drop(
-        ["placement_status", "student_id", "cluster", "segment"],
-        axis=1
-    )
+@st.cache_data(show_spinner=False)
+def run_pipeline(input_df=None):
 
-    df["placement_prob"] = model.predict_proba(X)[:, 1]
+    model = load_model()
 
+    # -----------------------------
+    # Data Input
+    # -----------------------------
+    if input_df is None:
+        df = generate_data()
+    else:
+        df = input_df.copy()
+
+    # -----------------------------
+    # 🔥 FIX: HANDLE FEATURE MISMATCH
+    # -----------------------------
+    
+    # Add missing columns
+    for col in EXPECTED_COLUMNS:
+        if col not in df.columns:
+            df[col] = 0
+
+    # Remove extra columns (like placement_status)
+    df = df[[col for col in EXPECTED_COLUMNS if col in df.columns]]
+
+    # Ensure correct order
+    df = df[EXPECTED_COLUMNS]
+
+    # -----------------------------
+    # Prediction
+    # -----------------------------
+    df["placement_prob"] = model.predict_proba(df)[:, 1]
+
+    # -----------------------------
+    # Risk Score
+    # -----------------------------
     df["risk_score"] = (
         (1 - df["placement_prob"]) * 50 +
         (100 - df["coding_score"]) * 0.2 +
-        df["last_activity_days"] * 0.5 +
+        (df["last_activity_days"]) * 0.5 +
         (50 - df["number_of_applications"]) * 0.3
     )
 
     df["risk_score"] = df["risk_score"].clip(0, 100)
 
-    def label(x):
-        if x > 70:
+    def risk_label(score):
+        if score > 70:
             return "High Risk"
-        elif x > 40:
+        elif score > 40:
             return "Medium Risk"
         else:
             return "Low Risk"
 
-    df["risk_level"] = df["risk_score"].apply(label)
+    df["risk_level"] = df["risk_score"].apply(risk_label)
 
-    return df
+    # -----------------------------
+    # Segmentation
+    # -----------------------------
+    features = df[[
+        "cgpa", "coding_score", "communication_score",
+        "mock_interview_score", "aptitude_score"
+    ]]
 
+    kmeans = KMeans(n_clusters=3, random_state=42)
+    df["cluster"] = kmeans.fit_predict(features)
 
-# -----------------------------
-# 5. Recommendations
-# -----------------------------
-def generate_recommendations(row):
-    recs = []
+    mapping = {0: "Unprepared", 1: "Risky", 2: "Ready"}
+    df["segment"] = df["cluster"].map(mapping)
 
-    if row["coding_score"] < 50:
-        recs.append("Practice DSA daily")
+    # -----------------------------
+    # Recommendations
+    # -----------------------------
+    def generate_recommendations(row):
+        recs = []
 
-    if row["communication_score"] < 50:
-        recs.append("Improve communication skills")
+        if row["coding_score"] < 50:
+            recs.append("Practice DSA daily")
 
-    if row["aptitude_score"] < 50:
-        recs.append("Practice aptitude tests")
+        if row["communication_score"] < 50:
+            recs.append("Attend mock interviews")
 
-    if row["number_of_applications"] < 10:
-        recs.append("Apply to more companies")
+        if row["aptitude_score"] < 50:
+            recs.append("Practice aptitude tests")
 
-    if row["last_activity_days"] > 15:
-        recs.append("Re-engage with placement portal")
+        if row["number_of_applications"] < 10:
+            recs.append("Apply to more companies")
 
-    if row["risk_score"] > 70:
-        recs.append("⚠️ Immediate TPC intervention needed")
+        if row["last_activity_days"] > 15:
+            recs.append("Re-engage in portal")
 
-    return ", ".join(recs)
+        if row["risk_score"] > 70:
+            recs.append("⚠️ Immediate TPC intervention")
 
+        return ", ".join(recs)
 
-def apply_recommendations(df):
     df["recommendations"] = df.apply(generate_recommendations, axis=1)
-    return df
-
-
-# -----------------------------
-# 6. Full Pipeline
-# -----------------------------
-def run_pipeline():
-    df = generate_data()
-
-    model = train_model(df)
-
-    df, _ = cluster_students(df)
-
-    df = calculate_risk(df, model)
-
-    df = apply_recommendations(df)
 
     return df
